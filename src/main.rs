@@ -60,12 +60,19 @@ impl<K, V> Tree<K, V> where K: PartialEq + Clone + Debug, V: Clone {
         let subtree = self.obtain_subtree(path);
         let values = subtree.values.get_or_insert(Vec::new());
         values.append(&mut objects);
-        // sort to facilitate comparisons;
+    }
+
+    fn add_values_with_path(&mut self, objects: &mut Vec<(Vec<K>, V)>) {
+        while let Some(e) = objects.pop() {
+            let subtree = self.obtain_subtree(&e.0);
+            let values = subtree.values.get_or_insert(Vec::new());
+            values.push(e.1);
+        }
     }
 }
 
 impl<K, V> Tree<K, V> where K: PartialEq + Clone + Ord, V: Clone + Ord {
-    /// sort to facilitate 
+    /// sort to facilitate comparisons
     fn sort(&mut self) {
         self.children.sort();
         if let Some(ref mut values) = self.values {
@@ -221,50 +228,29 @@ impl DifferenceTree<OsString, Object> {
 async fn read_elements_from_bucket(bucket: &Bucket) -> Result<Tree<OsString, Object>, S3Error> {
     let mut res = Tree::new("/");
 
-    // list of paths to visit
-    let mut to_visit: Vec<String> = vec![String::from("")];
-    while to_visit.len() > 0 {
+    let mut is_finished = false;
+    let mut continuation_token = None;
+    while !is_finished {
+        let bucket_res_list = bucket.list_page("".into(), None, continuation_token).await?;
+        let list_obj = &bucket_res_list.0;
 
-        let current_path = to_visit.pop().unwrap();
-        let mut current_path_splitted = current_path.split("/")
-            .map(|x| x.to_string().into())
-            .collect::<Vec<OsString>>();
-        // delete the empty string at the end of the path
-        current_path_splitted.pop();
-
-        let mut is_finished = false;
-        let mut continuation_token = None;
-        while !is_finished {
-            let bucket_res_list = bucket.list_page(current_path.clone(), Some("/".to_string()), continuation_token).await?;
-            let list_obj = &bucket_res_list.0;
-
-            let mut keys: Vec<Object> = list_obj.contents
-                .iter()
-                .map(|e| (&e.key, e.e_tag.clone()))
-                // only keep the file name
-                .map(|(e, v)| (e.rsplit("/").map(|v| v.to_string()).next().unwrap(), v))
-                // filter out directories
-                .filter(|(e, _)| e.len() > 0)
-                // convert to an Object
-                .map(|(e, v)|
-                    Object {
-                        name: e.into(),
-                        hash: v
-                    }
-                ).collect();
-
-            if keys.len() > 0 {
-                res.add_values(current_path_splitted.as_slice(), &mut keys);
-            }
-
-            if let Some(common_prefixes) = &list_obj.common_prefixes {
-                let mut common_prefixes = common_prefixes.iter().map(|x| x.prefix.clone()).collect();
-                to_visit.append(&mut common_prefixes);
-            }
-
-            is_finished  = !list_obj.is_truncated;
-            continuation_token = list_obj.next_continuation_token.clone();
+        let mut keys = Vec::with_capacity(list_obj.contents.len());
+        for e in &list_obj.contents {
+            let mut paths: Vec<OsString> = e.key.split("/").map(|e| e.into()).collect();
+            let file_name = paths.pop().unwrap();
+            keys.push((paths,
+                Object {
+                    name: file_name.into(),
+                    hash: e.e_tag[1..e.e_tag.len()-1].to_string()
+                }));
         }
+
+        if keys.len() > 0 {
+            res.add_values_with_path(&mut keys);
+        }
+
+        is_finished  = !list_obj.is_truncated;
+        continuation_token = list_obj.next_continuation_token.clone();
     }
     res.sort();
     Ok(res)
@@ -358,18 +344,20 @@ async fn main()-> Result<(), S3Error> {
 
     let bucket = Bucket::new(matches.value_of("Bucket").unwrap(), region, credentials)?;
 
+    println!("Listing foreign files...");
     let bucket_objects = read_elements_from_bucket(&bucket).await?;
 
 
-    println!("{:?}", bucket_objects);
-
+    println!("Listing local files...");
     let folder = Path::new(matches.value_of("Folder").unwrap());
     let folder_objects = read_elements_from_folder(&folder).await.unwrap();
 
+    println!("Computing the difference...");
     let difference = DifferenceTreeResult::try_from(&(Some(&bucket_objects), Some(&folder_objects))).unwrap();
 
     if let DifferenceTreeResult(Some(d)) = difference {
         d.update_bucket(&bucket, &folder).await?;
     }
+    println!("Sync complete");
     Ok(())
 }
