@@ -1,0 +1,12 @@
+[package]
+name = "s3s"
+version = "0.1.0"
+authors = ["Simon THOBY <git@nightmared.fr>"]
+edition = "2018"
+
+[dependencies]
+chrono = "0.4"
+rust-s3 = "0.19"
+clap = "2.33"
+tokio = { version = "0.2.18", features = ["fs", "stream"] }
+md5 = "0.7.0"
