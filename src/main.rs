@@ -47,7 +47,7 @@ impl ObjectModificationListing {
 			Ok(x) => ObjectModificationListing(from_slice(&x).unwrap()),
 			Err(e) => {
 				println!("Could not find file file {:?}, creating a default file config", file);
-				println!("Note: this mesage is perfectly normal if this is the first time you are running s3s against this folder.");
+				println!("Note: this message is perfectly normal if this is the first time you are running s3s against this folder.");
 				ObjectModificationListing(Tree::new())
 			}
 		})
@@ -60,9 +60,9 @@ impl ObjectModificationListing {
 			match self.0.get(path).and_then(|listing_x_list|
 				listing_x_list.iter()
 					.filter(|listing_x| listing_x.name == x.name)
-					// reuse the hash only if the modification date in the file is more recent
+					// reuse the hash only if the modification date in the cache file is more recent
 					// than the modification date on the fileystem
-					.filter(|listing_x| listing_x.last_modification_date >= x.last_modification_date)
+					.filter(|listing_x| listing_x.last_modification_date < x.last_modification_date)
 					.next()
 					.and_then(|listing_x| Some(listing_x.clone()))
 			) {
