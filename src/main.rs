@@ -45,7 +45,7 @@ impl ObjectModificationListing {
 	async fn load(file: impl AsRef<Path> + Debug) -> Result<Self, tokio::io::Error> {
 		Ok(match read(&file).await {
 			Ok(x) => ObjectModificationListing(from_slice(&x).unwrap()),
-			Err(e) => {
+			Err(_) => {
 				println!("Could not find file file {:?}, creating a default file config", file);
 				println!("Note: this message is perfectly normal if this is the first time you are running s3s against this folder.");
 				ObjectModificationListing(Tree::new())
@@ -180,7 +180,7 @@ impl<K, V> Tree<K, V> where K: PartialEq + Clone + Debug, V: Clone {
 		}
 	}
 
-	fn transform<F, W>(&self, fun: &F) -> Tree<K, W> where F: Fn(&V) -> W {
+	/*fn transform<F, W>(&self, fun: &F) -> Tree<K, W> where F: Fn(&V) -> W {
 		let children = self.children
 			.iter()
 			.map(|(key, child)| (key.clone(), child.transform(fun)))
@@ -193,7 +193,7 @@ impl<K, V> Tree<K, V> where K: PartialEq + Clone + Debug, V: Clone {
 			children,
 			values
 		}
-	}
+	}*/
 
 	fn transform_with_path_internal<'a, F, W>(&'a self, fun: &F, path: &mut Vec<&'a K>) -> Tree<K, W> where F: Fn(&[&K], &V) -> W {
 		let children = self.children.iter().map(|(key, child)| {
@@ -499,21 +499,31 @@ async fn main()-> Result<(), S3Error> {
 	let secret_key = String::from(matches.value_of("Secret key").unwrap());
 	let credentials = Credentials::new(Some(access_key), Some(secret_key), None, None).await?;
 
-	let bucket = Bucket::new(matches.value_of("Bucket").unwrap(), region, credentials)?;
 
-	println!("Listing foreign files...");
-	let bucket_objects = read_elements_from_bucket(&bucket).await?;
+	println!("Listing files...");
+	let bucket = Bucket::new(matches.value_of("Bucket").unwrap(), region.clone(), credentials.clone())?;
+	let bucket_objects = tokio::spawn(async move {
+		let res = read_elements_from_bucket(&bucket).await;
+		println!("Remote files listed.");
+		res
+	});
 
+	let folder = matches.value_of("Folder").unwrap();
+	let folder_path = PathBuf::from(folder);
+	let folder_objects = tokio::spawn(async move {
+		let res = read_elements_from_folder(folder_path.as_path()).await;
+		println!("Local files listed.");
+		res
+	});
 
-	println!("Listing local files...");
-	let folder = Path::new(matches.value_of("Folder").unwrap());
-	let folder_objects = read_elements_from_folder(&folder).await.unwrap();
+	let (folder_objects, bucket_objects) = (folder_objects.await.unwrap()?, bucket_objects.await.unwrap()?);
 
 	println!("Computing the difference...");
 	let difference = DifferenceTreeResult::from(&(Some(&bucket_objects), Some(&folder_objects)));
 
 	if let DifferenceTreeResult(Some(d)) = difference {
-		d.update_bucket(&bucket, &folder).await?;
+		let bucket = Bucket::new(matches.value_of("Bucket").unwrap(), region, credentials)?;
+		d.update_bucket(&bucket, &Path::new(folder)).await?;
 	}
 	println!("Sync complete");
 	Ok(())
