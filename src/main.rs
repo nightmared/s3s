@@ -419,7 +419,7 @@ async fn read_update_data_from_folder(folder: &Path) -> Result<Tree<OsString, Ob
 			// TODO: symlinks handling
 			if file_type.is_dir() {
 				to_visit.push(entry.path().to_path_buf());
-			} else {
+			} else if file_type.is_file() {
 				let name = entry.path().file_name().unwrap().to_os_string();
 				if name == RESERVED_FILE {
 					continue;
