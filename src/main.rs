@@ -501,7 +501,8 @@ async fn main()-> Result<(), S3Error> {
 
 
 	println!("Listing files...");
-	let bucket = Bucket::new(matches.value_of("Bucket").unwrap(), region.clone(), credentials.clone())?;
+	let mut bucket = Bucket::new(matches.value_of("Bucket").unwrap(), region.clone(), credentials.clone())?;
+	bucket.add_header("x-amz-storage-class", "GLACIER");
 	let bucket_objects = tokio::spawn(async move {
 		let res = read_elements_from_bucket(&bucket).await;
 		println!("Remote files listed.");
@@ -522,7 +523,8 @@ async fn main()-> Result<(), S3Error> {
 	let difference = DifferenceTreeResult::from(&(Some(&bucket_objects), Some(&folder_objects)));
 
 	if let DifferenceTreeResult(Some(d)) = difference {
-		let bucket = Bucket::new(matches.value_of("Bucket").unwrap(), region, credentials)?;
+		let mut bucket = Bucket::new(matches.value_of("Bucket").unwrap(), region, credentials)?;
+		bucket.add_header("x-amz-storage-class", "GLACIER");
 		d.update_bucket(&bucket, &Path::new(folder)).await?;
 	}
 	println!("Sync complete");

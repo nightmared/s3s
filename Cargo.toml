@@ -1,6 +1,6 @@
 [package]
 name = "s3s"
-version = "0.1.2"
+version = "0.1.3"
 authors = ["Simon THOBY <git@nightmared.fr>"]
 edition = "2018"
 
