@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt::Debug;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use clap::{App, Arg};
+use md5::{Digest, Md5};
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use s3::region::Region;
@@ -13,6 +16,7 @@ use s3::S3Error;
 use serde::{Deserialize, Serialize};
 use serde_json::{from_slice, to_vec};
 use tokio::fs::{read, read_dir, write};
+use tokio::io::AsyncReadExt;
 
 mod select;
 use select::{selector, Selector};
@@ -61,41 +65,62 @@ impl ObjectModificationListing {
             }
         })
     }
+
     async fn save(&self, file: impl AsRef<Path>) -> Result<(), tokio::io::Error> {
         write(file, to_vec(&self.0).unwrap()).await
     }
-    fn from_update_data(
-        &self,
-        folder: impl AsRef<Path>,
-        tree: &Tree<OsString, ObjectUpdateData>,
+
+    async fn from_update_data<'a>(
+        &'a self,
+        folder: &'a Path,
+        tree: &'a Tree<OsString, ObjectUpdateData>,
     ) -> ObjectModificationListing {
-        ObjectModificationListing(tree.transform_with_path(&|path, x| {
-            match self.0.get(path).and_then(|listing_x_list| {
-                listing_x_list
-                    .iter()
-                    .filter(|listing_x| listing_x.name == x.name)
-                    // reuse the hash only if the modification date in the cache file is more recent
-                    // than the modification date on the fileystem
-                    .filter(|listing_x| listing_x.last_modification_date < x.last_modification_date)
-                    .next()
-                    .and_then(|listing_x| Some(listing_x.clone()))
-            }) {
-                Some(x) => x,
-                None => {
-                    // create a new value
-                    let mut file_path = folder.as_ref().to_path_buf();
-                    for e in path {
-                        file_path.push(e);
-                    }
-                    file_path.push(&x.name);
-                    Object {
-                        name: x.name.clone(),
-                        hash: hash_file(&file_path).unwrap(),
-                        last_modification_date: x.last_modification_date,
-                    }
-                }
+        ObjectModificationListing(
+            tree.transform_with_path(&|path, obj| {
+                Box::pin(path_transform(folder, self, path, obj))
+            })
+            .await,
+        )
+    }
+}
+
+async fn path_transform<'a>(
+    folder: &'a Path,
+    source_tree: &'a ObjectModificationListing,
+    path: Arc<Vec<OsString>>,
+    obj: &'a ObjectUpdateData,
+) -> Object {
+    let mut res = None;
+    // the logic is the following: check if the same version of the file is present across the list of
+    // files present in the same folder
+    if let Some(objs) = source_tree.0.get(&path) {
+        // reuse the hash only if the cache file is as old as the one on the fileystem
+        res = objs
+            .iter()
+            .filter(|cached_obj| {
+                cached_obj.name == obj.name
+                    && cached_obj.last_modification_date < obj.last_modification_date
+            })
+            // take the first entry, as there can only be a single entry for a
+            // given name
+            .next();
+    }
+
+    match res {
+        Some(res) => res.clone(),
+        None => {
+            // create a new value
+            let mut file_path = folder.to_path_buf();
+            for e in &*path {
+                file_path.push(e);
             }
-        }))
+            file_path.push(&obj.name);
+            Object {
+                name: obj.name.clone(),
+                hash: hash_file(&file_path).await.unwrap(),
+                last_modification_date: obj.last_modification_date,
+            }
+        }
     }
 }
 
@@ -139,11 +164,11 @@ where
         }
     }
 
-    fn get_subtree(&self, path: &[&K]) -> Option<&Tree<K, V>> {
+    fn get_subtree(&self, path: &[K]) -> Option<&Tree<K, V>> {
         let mut subtree = self;
         'ext: for entry in path {
             for i in 0..subtree.children.len() {
-                if subtree.children[i].0 == **entry {
+                if subtree.children[i].0 == *entry {
                     subtree = &subtree.children[i].1;
                     continue 'ext;
                 }
@@ -173,7 +198,7 @@ where
         subtree
     }
 
-    fn get(&self, path: &[&K]) -> Option<&[V]> {
+    fn get(&self, path: &[K]) -> Option<&[V]> {
         self.get_subtree(path)
             .and_then(|sub| sub.values.as_ref().and_then(|values| Some(values.as_ref())))
     }
@@ -209,35 +234,49 @@ where
 
     fn transform_with_path_internal<'a, F, W>(
         &'a self,
-        fun: &F,
-        path: &mut Vec<&'a K>,
-    ) -> Tree<K, W>
+        fun: &'a F,
+        path: Vec<K>,
+    ) -> Pin<Box<dyn Future<Output = Tree<K, W>> + 'a>>
     where
-        F: Fn(&[&K], &V) -> W,
+        F: Fn(Arc<Vec<K>>, &'a V) -> Pin<Box<dyn Future<Output = W> + 'a>>,
     {
-        let children = self
-            .children
-            .iter()
-            .map(|(key, child)| {
-                path.push(key);
-                let res = (key.clone(), child.transform_with_path_internal(fun, path));
-                path.pop();
-                res
-            })
-            .collect();
-        let values = self
-            .values
-            .as_ref()
-            .map(|x| x.iter().map(|e| fun(&path, e)).collect());
+        Box::pin(async move {
+            let mut children = Vec::with_capacity(self.children.len());
+            for (key, child) in &self.children {
+                let mut path = path.clone();
+                path.push(key.clone());
+                let res = child.transform_with_path_internal(fun, path).await;
+                children.push((key.clone(), res));
+            }
 
-        Tree { children, values }
+            let path = Arc::new(path);
+
+            let values = match &self.values {
+                Some(self_values) => {
+                    let mut values = Vec::with_capacity(self_values.len());
+
+                    for val in self_values {
+                        // TODO: run concurrently
+                        values.push(fun(path.clone(), &val).await);
+                    }
+
+                    Some(values)
+                }
+                None => None,
+            };
+
+            Tree { children, values }
+        })
     }
 
-    fn transform_with_path<F, W>(&self, fun: &F) -> Tree<K, W>
+    fn transform_with_path<'a, F, W>(
+        &'a self,
+        fun: &'a F,
+    ) -> Pin<Box<dyn Future<Output = Tree<K, W>> + 'a>>
     where
-        F: Fn(&[&K], &V) -> W,
+        F: Fn(Arc<Vec<K>>, &'a V) -> Pin<Box<dyn Future<Output = W> + 'a>>,
     {
-        self.transform_with_path_internal(fun, &mut Vec::new())
+        self.transform_with_path_internal(fun, Vec::new())
     }
 }
 
@@ -354,7 +393,7 @@ impl DifferenceTree<OsString, Object> {
         bucket: &'a Bucket,
         prefix: PathBuf,
         base_dir: &'a Path,
-        selector: &Selector<Pin<Box<dyn std::future::Future<Output = Result<(), S3Error>> + 'a>>>,
+        selector: &Selector<Pin<Box<dyn Future<Output = Result<(), S3Error>> + 'a>>>,
     ) {
         let mut current_dir = base_dir.to_path_buf();
         current_dir.push(prefix.as_path());
@@ -438,9 +477,18 @@ async fn read_elements_from_bucket(bucket: &Bucket) -> Result<Tree<OsString, Obj
 }
 
 /// read a file and compute its hash
-fn hash_file(path: impl AsRef<Path>) -> Result<String, std::io::Error> {
-    let file_content = std::fs::read(&path)?;
-    Ok(format!("{:x}", md5::compute(&file_content)))
+async fn hash_file(path: impl AsRef<Path>) -> Result<String, std::io::Error> {
+    let mut fd = tokio::fs::File::open(path).await?;
+    let mut digest = Md5::new();
+    let mut buf = Vec::with_capacity(4096);
+    loop {
+        if fd.read(&mut buf).await? == 0 {
+            return Ok(format!("{:?}", &digest.finalize()[..]));
+        }
+        //tokio::task::spawn_blocking(move || digest.update(&buf)).await?;
+        digest.update(&buf);
+        buf.truncate(0);
+    }
 }
 
 /// Iterate over all the objects in the folder, and generate a tree of their hierarchy
@@ -503,7 +551,7 @@ async fn read_elements_from_folder(
 
     let update_data = read_update_data_from_folder(folder).await?;
 
-    let updated_listing = old_listing.from_update_data(folder, &update_data);
+    let updated_listing = old_listing.from_update_data(folder, &update_data).await;
 
     updated_listing.save(&file_listing).await?;
 
@@ -581,7 +629,7 @@ async fn main() -> Result<(), S3Error> {
     let folder_path = PathBuf::from(folder);
 
     let listing_tasks: Vec<
-        Pin<Box<dyn std::future::Future<Output = Result<Tree<OsString, Object>, std::io::Error>>>>,
+        Pin<Box<dyn Future<Output = Result<Tree<OsString, Object>, std::io::Error>>>>,
     > = vec![
         Box::pin(async move {
             let res = read_elements_from_folder(folder_path.as_path()).await?;
@@ -591,7 +639,7 @@ async fn main() -> Result<(), S3Error> {
         Box::pin(async move {
             let res = read_elements_from_bucket(&bucket)
                 .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             println!("Remote files listed.");
             Ok(res)
         }),
