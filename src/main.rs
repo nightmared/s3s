@@ -1,22 +1,25 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt::Debug;
+use std::fs::File;
 use std::future::Future;
+use std::hash::Hash;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use clap::{App, Arg};
 use md5::{Digest, Md5};
+use rayon::prelude::*;
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use s3::region::Region;
 use s3::S3Error;
 use serde::{Deserialize, Serialize};
 use serde_json::{from_slice, to_vec};
+use serde_with::serde_as;
 use tokio::fs::{read, read_dir, write};
-use tokio::io::AsyncReadExt;
 
 mod select;
 use select::{selector, Selector};
@@ -53,17 +56,22 @@ struct ObjectModificationListing(Tree<OsString, Object>);
 
 impl ObjectModificationListing {
     async fn load(file: impl AsRef<Path> + Debug) -> Result<Self, tokio::io::Error> {
-        Ok(match read(&file).await {
-            Ok(x) => ObjectModificationListing(from_slice(&x).unwrap()),
+        match read(&file).await.map(|x| {
+            from_slice(&x).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        }) {
+            Ok(Ok(x)) => return Ok(ObjectModificationListing(x)),
+            Ok(Err(e)) => {
+                println!("Could not parse the file {:?}: {:?}", file, e);
+            }
             Err(_) => {
                 println!(
-                    "Could not find file file {:?}, creating a default file config",
+                    "Could not find file {:?}, creating a default file config",
                     file
                 );
                 println!("Note: this message is perfectly normal if this is the first time you are running s3s against this folder.");
-                ObjectModificationListing(Tree::new())
             }
-        })
+        }
+        Ok(ObjectModificationListing(Tree::new()))
     }
 
     async fn save(&self, file: impl AsRef<Path>) -> Result<(), tokio::io::Error> {
@@ -76,18 +84,16 @@ impl ObjectModificationListing {
         tree: &'a Tree<OsString, ObjectUpdateData>,
     ) -> ObjectModificationListing {
         ObjectModificationListing(
-            tree.transform_with_path(&|path, obj| {
-                Box::pin(path_transform(folder, self, path, obj))
-            })
-            .await,
+            tree.transform_with_path(&|path, obj| path_transform(folder, self, path, obj))
+                .await,
         )
     }
 }
 
-async fn path_transform<'a>(
+fn path_transform<'a>(
     folder: &'a Path,
     source_tree: &'a ObjectModificationListing,
-    path: Arc<Vec<OsString>>,
+    path: Vec<OsString>,
     obj: &'a ObjectUpdateData,
 ) -> Object {
     let mut res = None;
@@ -117,7 +123,7 @@ async fn path_transform<'a>(
             file_path.push(&obj.name);
             Object {
                 name: obj.name.clone(),
-                hash: hash_file(&file_path).await.unwrap(),
+                hash: hash_file(&file_path).unwrap(),
                 last_modification_date: obj.last_modification_date,
             }
         }
@@ -146,54 +152,55 @@ struct ObjectUpdateData {
     last_modification_date: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-struct Tree<K, V> {
-    children: Vec<(K, Tree<K, V>)>,
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Tree<K, V>
+where
+    K: Eq + Hash + Serialize + for<'e> Deserialize<'e>,
+    V: Eq,
+{
+    #[serde_as(as = "Vec<(_, _)>")]
+    children: HashMap<K, Tree<K, V>>,
     values: Option<Vec<V>>,
 }
 
 impl<K, V> Tree<K, V>
 where
-    K: PartialEq + Clone + Debug,
-    V: Clone,
+    K: Eq + Hash + Clone + Serialize + for<'e> Deserialize<'e> + Send + Sync,
+    V: Eq + Clone + Sync,
 {
     fn new() -> Self {
         Tree {
-            children: Vec::new(),
+            children: HashMap::new(),
             values: None,
         }
     }
 
     fn get_subtree(&self, path: &[K]) -> Option<&Tree<K, V>> {
         let mut subtree = self;
-        'ext: for entry in path {
-            for i in 0..subtree.children.len() {
-                if subtree.children[i].0 == *entry {
-                    subtree = &subtree.children[i].1;
-                    continue 'ext;
+        for entry in path {
+            match subtree.children.get(entry) {
+                Some(tree) => {
+                    subtree = tree;
                 }
+                // couldn't find the path in the tree
+                None => return None,
             }
-            // couldn't find the path in the tree
-            return None;
         }
         Some(subtree)
     }
 
     fn create_subtree(&mut self, path: &[K]) -> &mut Tree<K, V> {
         let mut subtree = self;
-        'ext: for entry in path {
-            for i in 0..subtree.children.len() {
-                if subtree.children[i].0 == *entry {
-                    // the tree already contain this path, let's go there
-                    subtree = &mut subtree.children[i].1;
-                    continue 'ext;
-                }
+        for entry in path {
+            if let Some(_) = subtree.children.get(entry) {
+                continue;
             }
 
             // too bad, the path isn't there yet, let's fend for ourselves and build
             // it with our bare hands (and a little help from the compiler)
-            subtree.children.push((entry.clone(), Tree::new()));
-            subtree = &mut subtree.children.last_mut().unwrap().1;
+            subtree.children.insert(entry.clone(), Tree::new());
+            subtree = subtree.children.get_mut(entry).unwrap();
         }
         subtree
     }
@@ -217,53 +224,34 @@ where
         }
     }
 
-    /*fn transform<F, W>(&self, fun: &F) -> Tree<K, W> where F: Fn(&V) -> W {
-        let children = self.children
-            .iter()
-            .map(|(key, child)| (key.clone(), child.transform(fun)))
-            .collect();
-        let values = self.values
-            .as_ref()
-            .map(|x| x.iter().map(|e| fun(e)).collect());
-
-        Tree {
-            children,
-            values
-        }
-    }*/
-
     fn transform_with_path_internal<'a, F, W>(
         &'a self,
         fun: &'a F,
         path: Vec<K>,
     ) -> Pin<Box<dyn Future<Output = Tree<K, W>> + 'a>>
     where
-        F: Fn(Arc<Vec<K>>, &'a V) -> Pin<Box<dyn Future<Output = W> + 'a>>,
+        F: Fn(Vec<K>, &V) -> W + Sync,
+        K: Hash,
+        W: Eq + Send,
     {
         Box::pin(async move {
-            let mut children = Vec::with_capacity(self.children.len());
+            let mut children = HashMap::with_capacity(self.children.len());
             for (key, child) in &self.children {
                 let mut path = path.clone();
                 path.push(key.clone());
                 let res = child.transform_with_path_internal(fun, path).await;
-                children.push((key.clone(), res));
+                children.insert(key.clone(), res);
             }
 
-            let path = Arc::new(path);
-
-            let values = match &self.values {
-                Some(self_values) => {
-                    let mut values = Vec::with_capacity(self_values.len());
-
-                    for val in self_values {
-                        // TODO: run concurrently
-                        values.push(fun(path.clone(), &val).await);
-                    }
-
-                    Some(values)
-                }
-                None => None,
-            };
+            let values = tokio::task::block_in_place(|| {
+                self.values.as_ref().map(|self_values| {
+                    self_values
+                        .as_slice()
+                        .par_iter()
+                        .map(|x| fun(path.clone(), &x))
+                        .collect()
+                })
+            });
 
             Tree { children, values }
         })
@@ -274,29 +262,16 @@ where
         fun: &'a F,
     ) -> Pin<Box<dyn Future<Output = Tree<K, W>> + 'a>>
     where
-        F: Fn(Arc<Vec<K>>, &'a V) -> Pin<Box<dyn Future<Output = W> + 'a>>,
+        F: Fn(Vec<K>, &V) -> W + Sync,
+        W: Eq + Send,
     {
         self.transform_with_path_internal(fun, Vec::new())
     }
 }
 
-impl<K, V> Tree<K, V>
-where
-    K: PartialEq + Clone + Ord,
-    V: Clone + Ord,
-{
-    /// sort to facilitate comparisons
-    fn sort(&mut self) {
-        self.children.sort();
-        if let Some(ref mut values) = self.values {
-            values.sort();
-        }
-    }
-}
-
 #[derive(Debug)]
 struct DifferenceTree<K, V> {
-    children: Vec<(K, DifferenceTree<K, V>)>,
+    children: HashMap<K, DifferenceTree<K, V>>,
     new_values: Option<Vec<V>>,
     old_values: Option<Vec<V>>,
 }
@@ -306,8 +281,8 @@ struct DifferenceTreeResult<K, V>(Option<DifferenceTree<K, V>>);
 
 impl<K, V> From<&(Option<&Tree<K, V>>, Option<&Tree<K, V>>)> for DifferenceTreeResult<K, V>
 where
-    K: PartialEq + Eq + std::hash::Hash + Clone,
-    V: Clone + PartialEq,
+    K: Eq + std::hash::Hash + Clone + Serialize + for<'e> Deserialize<'e>,
+    V: Clone + Eq,
 {
     fn from((a, b): &(Option<&Tree<K, V>>, Option<&Tree<K, V>>)) -> Self {
         if a.is_none() && b.is_none() {
@@ -319,21 +294,23 @@ where
         let mut new_values = Vec::new();
 
         if let Some(a) = a {
-            for e in &a.children {
-                children_set.insert(&e.0, (Some(&e.1), None));
+            for (child_key, child_value) in &a.children {
+                children_set.insert(child_key, (Some(child_value), None));
             }
+
             if let Some(values_a) = &a.values {
                 for e in values_a {
                     old_values.push(e.clone());
                 }
             }
         }
+
         if let Some(b) = b {
-            for e in &b.children {
-                if let Some(mut v) = children_set.get_mut(&e.0) {
-                    v.1 = Some(&e.1);
+            for (child_key, child_value) in &b.children {
+                if let Some(mut v) = children_set.get_mut(&child_key) {
+                    v.1 = Some(child_value);
                 } else {
-                    children_set.insert(&e.0, (None, Some(&e.1)));
+                    children_set.insert(child_key, (None, Some(child_value)));
                 }
             }
 
@@ -355,11 +332,11 @@ where
             }
         }
 
-        let mut children = Vec::new();
+        let mut children = HashMap::new();
         for i in children_set.keys() {
             // compare the two children but delete the common parts
             if let DifferenceTreeResult(Some(x)) = children_set.get(i).unwrap().into() {
-                children.push(((*i).clone(), x));
+                children.insert((*i).clone(), x);
             }
         }
 
@@ -437,7 +414,7 @@ impl DifferenceTree<OsString, Object> {
     }
 
     async fn update_bucket(&self, bucket: &Bucket, base_dir: &Path) -> Result<(), S3Error> {
-        let selector = selector(vec![], 12);
+        let selector = selector(vec![], 5);
         self.update_bucket_with_prefix(bucket, PathBuf::new(), base_dir, &selector);
         selector.await
     }
@@ -472,20 +449,18 @@ async fn read_elements_from_bucket(bucket: &Bucket) -> Result<Tree<OsString, Obj
         }
     }
 
-    res.sort();
     Ok(res)
 }
 
 /// read a file and compute its hash
-async fn hash_file(path: impl AsRef<Path>) -> Result<String, std::io::Error> {
-    let mut fd = tokio::fs::File::open(path).await?;
+fn hash_file(path: impl AsRef<Path>) -> Result<String, std::io::Error> {
+    let mut fd = File::open(path)?;
     let mut digest = Md5::new();
     let mut buf = Vec::with_capacity(4096);
     loop {
-        if fd.read(&mut buf).await? == 0 {
+        if fd.read(&mut buf)? == 0 {
             return Ok(format!("{:?}", &digest.finalize()[..]));
         }
-        //tokio::task::spawn_blocking(move || digest.update(&buf)).await?;
         digest.update(&buf);
         buf.truncate(0);
     }
@@ -537,7 +512,7 @@ async fn read_update_data_from_folder(
             res.add_values(current_path_splitted.as_slice(), &mut list_paths);
         }
     }
-    res.sort();
+
     Ok(res)
 }
 
@@ -604,6 +579,13 @@ async fn main() -> Result<(), S3Error> {
                 .takes_value(true)
                 .required(true),
         )
+        .arg(
+            Arg::with_name("Storage Class")
+                .long("storage-class")
+                .possible_values(&["standard", "glacier"])
+                .takes_value(true)
+                .default_value("glacier"),
+        )
         .get_matches();
 
     let region_name = matches.value_of("Region").unwrap().to_string();
@@ -655,7 +637,9 @@ async fn main() -> Result<(), S3Error> {
 
     if let DifferenceTreeResult(Some(d)) = difference {
         let mut bucket = Bucket::new(matches.value_of("Bucket").unwrap(), region, credentials)?;
-        bucket.add_header("x-amz-storage-class", "GLACIER");
+        if matches.value_of("Storage Class").unwrap() == "glacier" {
+            bucket.add_header("x-amz-storage-class", "GLACIER");
+        }
         d.update_bucket(&bucket, &Path::new(folder)).await?;
     }
     println!("Sync complete");
