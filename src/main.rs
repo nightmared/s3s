@@ -193,13 +193,12 @@ where
     fn create_subtree(&mut self, path: &[K]) -> &mut Tree<K, V> {
         let mut subtree = self;
         for entry in path {
-            if let Some(_) = subtree.children.get(entry) {
-                continue;
+            if subtree.children.get(entry) == None {
+                // too bad, the path isn't there yet, let's fend for ourselves and build
+                // it with our bare hands (and a little help from the compiler)
+                subtree.children.insert(entry.clone(), Tree::new());
             }
 
-            // too bad, the path isn't there yet, let's fend for ourselves and build
-            // it with our bare hands (and a little help from the compiler)
-            subtree.children.insert(entry.clone(), Tree::new());
             subtree = subtree.children.get_mut(entry).unwrap();
         }
         subtree

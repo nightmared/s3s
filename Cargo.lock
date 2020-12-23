@@ -1136,7 +1136,7 @@ dependencies = [
 [[package]]
 name = "rust-s3"
 version = "0.27.0-beta1"
-source = "git+https://github.com/nightmared/rust-s3#4d2a3731cb1cfc7c281f65b1829e7d9a904af622"
+source = "git+https://github.com/nightmared/rust-s3?rev=4d2a3731cb1cfc7c281f65b1829e7d9a904af622#4d2a3731cb1cfc7c281f65b1829e7d9a904af622"
 dependencies = [
  "async-trait",
  "aws-creds",
@@ -1183,7 +1183,7 @@ checksum = "71d301d4193d031abdd79ff7e3dd721168a9572ef3fe51a1517aba235bd8f86e"
 
 [[package]]
 name = "s3s"
-version = "0.1.4"
+version = "0.1.6"
 dependencies = [
  "chrono",
  "clap",
