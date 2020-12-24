@@ -123,7 +123,7 @@ fn path_transform<'a>(
             file_path.push(&obj.name);
             Object {
                 name: obj.name.clone(),
-                hash: hash_file(&file_path).unwrap(),
+                etag: hash_file(&file_path).unwrap(),
                 last_modification_date: obj.last_modification_date,
             }
         }
@@ -135,14 +135,14 @@ fn path_transform<'a>(
 #[derive(Debug, Clone, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct Object {
     name: OsString,
-    hash: String,
+    etag: String,
     #[serde(with = "datetime_utc_serde")]
     last_modification_date: DateTime<Utc>,
 }
 
 impl PartialEq for Object {
     fn eq(&self, res: &Self) -> bool {
-        self.name == res.name && self.hash == res.hash
+        self.name == res.name && self.etag == res.etag
     }
 }
 
@@ -434,7 +434,7 @@ async fn read_elements_from_bucket(bucket: &Bucket) -> Result<Tree<OsString, Obj
                 paths,
                 Object {
                     name: file_name.into(),
-                    hash: e.e_tag[1..e.e_tag.len() - 1].to_string(),
+                    etag: e.e_tag[1..e.e_tag.len() - 1].to_string(),
                     // doesn't matter for comparisons
                     last_modification_date: DateTime::parse_from_rfc3339(&e.last_modified)
                         .unwrap()
@@ -456,12 +456,41 @@ fn hash_file(path: impl AsRef<Path>) -> Result<String, std::io::Error> {
     let mut fd = File::open(path)?;
     let mut digest = Md5::new();
     let mut buf = Vec::with_capacity(4096);
+    for i in 0u64..4096 {
+        buf.push(i as u8);
+    }
+    let mut nb_read: usize = 0;
+    let mut parts_no = 0;
+    let mut parts_md5 = Vec::new();
     loop {
-        if fd.read(&mut buf)? == 0 {
-            return Ok(format!("{:?}", &digest.finalize()[..]));
+        let read = fd.read(&mut buf)?;
+        nb_read += read;
+        if read == 0 {
+            if parts_md5.len() == parts_no {
+                parts_md5.push(digest.finalize_reset());
+                //parts_md5.push(format!("{:x}", digest.finalize_reset()));
+                parts_no += 1;
+            }
+            if parts_md5.len() == 1 {
+                return Ok(format!("{:x}", parts_md5[0]));
+            }
+            let mut hexes = Md5::new();
+            for md5 in parts_md5 {
+                hexes.update(md5);
+            }
+            return Ok(format!(
+                "{}-{}",
+                format!("{:x}", hexes.finalize()),
+                parts_no
+            ));
         }
-        digest.update(&buf);
-        buf.truncate(0);
+
+        digest.update(&buf[0..read]);
+
+        if nb_read / s3::bucket::CHUNK_SIZE != parts_no {
+            parts_no += 1;
+            parts_md5.push(digest.finalize_reset());
+        }
     }
 }
 
@@ -599,12 +628,15 @@ async fn main() -> Result<(), S3Error> {
     let credentials = Credentials::new(Some(access_key), Some(secret_key), None, None, None)?;
 
     println!("Listing files...");
-    let mut bucket = Bucket::new(
+    let mut bucket = Bucket::new_with_path_style(
         matches.value_of("Bucket").unwrap(),
         region.clone(),
         credentials.clone(),
     )?;
-    bucket.add_header("x-amz-storage-class", "GLACIER");
+    if matches.value_of("Storage Class").unwrap() == "glacier" {
+        bucket.add_header("x-amz-storage-class", "GLACIER");
+    }
+    let bucket_clone = bucket.clone();
 
     let folder = matches.value_of("Folder").unwrap();
     let folder_path = PathBuf::from(folder);
@@ -618,7 +650,7 @@ async fn main() -> Result<(), S3Error> {
             Ok(res)
         }),
         Box::pin(async move {
-            let res = read_elements_from_bucket(&bucket)
+            let res = read_elements_from_bucket(&bucket_clone)
                 .await
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             println!("Remote files listed.");
@@ -630,15 +662,14 @@ async fn main() -> Result<(), S3Error> {
         [a, b] => (a, b),
         _ => panic!("Unknown error occured"),
     };
+    println!("{:?}", folder_objects);
+    println!("{:?}", bucket_objects);
 
     println!("Computing the difference...");
     let difference = DifferenceTreeResult::from(&(Some(bucket_objects), Some(folder_objects)));
+    println!("{:?}", difference);
 
     if let DifferenceTreeResult(Some(d)) = difference {
-        let mut bucket = Bucket::new(matches.value_of("Bucket").unwrap(), region, credentials)?;
-        if matches.value_of("Storage Class").unwrap() == "glacier" {
-            bucket.add_header("x-amz-storage-class", "GLACIER");
-        }
         d.update_bucket(&bucket, &Path::new(folder)).await?;
     }
     println!("Sync complete");
