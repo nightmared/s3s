@@ -364,6 +364,34 @@ where
     }
 }
 
+async fn delete_object(bucket: &Bucket, path: PathBuf) -> Result<()> {
+    println!("Deleting {:?}", path);
+    bucket
+        .delete_object(path.to_str().unwrap())
+        .await
+        .map(|_| ())
+}
+
+async fn upload_object(
+    bucket: &Bucket,
+    sha256: HeaderValue,
+    local_path: PathBuf,
+    path: PathBuf,
+) -> Result<()> {
+    println!("Uploading {:?}", path);
+    let mut custom_headers = HeaderMap::new();
+    custom_headers.insert(HeaderName::from_static("x-amz-meta-sha256"), sha256);
+    let status_code = bucket
+        .put_object_stream_with_headers(
+            local_path.to_str().unwrap(),
+            path.to_str().unwrap(),
+            Some(custom_headers),
+        )
+        .await?;
+    assert_eq!(status_code, 200);
+    Ok(())
+}
+
 impl DifferenceTree<OsString, Object> {
     fn update_bucket_with_prefix<'a>(
         &'a self,
@@ -381,44 +409,49 @@ impl DifferenceTree<OsString, Object> {
             child.update_bucket_with_prefix(bucket, prefix, base_dir, &selector)?;
         }
 
-        // TODO: for object supdate (aka deleted and then reuploaded, add some ordering)
-        if let Some(old_values) = &self.old_values {
-            for i in old_values {
-                let mut path = prefix.to_path_buf();
-                path.push(&i.name);
-                // delete the file in the bucket
-                selector.add(Box::pin(async move {
-                    println!("Deleting {:?}", path);
-                    bucket
-                        .delete_object(path.to_str().unwrap())
-                        .await
-                        .map(|_| ())
-                }));
-            }
-        }
-        if let Some(new_values) = &self.new_values {
-            for i in new_values {
-                let mut path = prefix.to_path_buf();
-                path.push(&i.name);
+        let old_value = vec![];
+        let old_values = if let Some(old_values) = &self.old_values {
+            old_values
+        } else {
+            &old_value
+        };
+
+        let mut new_values = if let Some(new_values) = &self.new_values {
+            new_values.clone()
+        } else {
+            vec![]
+        };
+
+        for i in old_values {
+            let mut path = prefix.to_path_buf();
+            path.push(&i.name);
+            if let Some((pos, new_val)) = new_values
+                .iter()
+                .enumerate()
+                .filter(|(_, val)| val.name == i.name)
+                .map(|(i, val)| (i, val.clone()))
+                .next()
+            {
+                new_values.swap_remove(pos);
                 let mut local_path = current_dir.to_path_buf();
                 local_path.push(&i.name);
-                // upload the local file
-                let sha256 = HeaderValue::from_bytes(i.sha256.as_bytes())?;
+                let sha256 = HeaderValue::from_bytes(new_val.sha256.as_bytes())?;
                 selector.add(Box::pin(async move {
-                    println!("Uploading {:?}", path);
-                    let mut custom_headers = HeaderMap::new();
-                    custom_headers.insert(HeaderName::from_static("x-amz-meta-sha256"), sha256);
-                    let status_code = bucket
-                        .put_object_stream_with_headers(
-                            local_path.to_str().unwrap(),
-                            path.to_str().unwrap(),
-                            Some(custom_headers),
-                        )
-                        .await?;
-                    assert_eq!(status_code, 200);
-                    Ok(())
+                    delete_object(bucket, path.clone()).await?;
+                    upload_object(bucket, sha256, local_path, path).await
                 }));
+            } else {
+                // delete the file in the bucket
+                selector.add(Box::pin(delete_object(bucket, path)));
             }
+        }
+        for i in new_values {
+            let mut path = prefix.to_path_buf();
+            path.push(&i.name);
+            let mut local_path = current_dir.to_path_buf();
+            local_path.push(&i.name);
+            let sha256 = HeaderValue::from_bytes(i.sha256.as_bytes())?;
+            selector.add(Box::pin(upload_object(bucket, sha256, local_path, path)));
         }
 
         Ok(())
