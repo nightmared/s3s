@@ -8,17 +8,18 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use clap::{App, Arg};
-use md5::{Digest, Md5};
+use http::header::{HeaderMap, HeaderName, HeaderValue};
 use rayon::prelude::*;
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use s3::region::Region;
-use s3::S3Error;
 use serde::{Deserialize, Serialize};
 use serde_json::{from_slice, to_vec};
 use serde_with::serde_as;
+use sha2::{Digest, Sha256};
 use tokio::fs::{read, read_dir, write};
 
 mod select;
@@ -55,7 +56,7 @@ mod datetime_utc_serde {
 struct ObjectModificationListing(Tree<OsString, Object>);
 
 impl ObjectModificationListing {
-    async fn load(file: impl AsRef<Path> + Debug) -> Result<Self, tokio::io::Error> {
+    async fn load(file: impl AsRef<Path> + Debug) -> Result<Self> {
         match read(&file).await.map(|x| {
             from_slice(&x).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         }) {
@@ -123,7 +124,7 @@ fn path_transform<'a>(
             file_path.push(&obj.name);
             Object {
                 name: obj.name.clone(),
-                etag: hash_file(&file_path).unwrap(),
+                sha256: hash_file(&file_path).unwrap(),
                 last_modification_date: obj.last_modification_date,
             }
         }
@@ -135,14 +136,14 @@ fn path_transform<'a>(
 #[derive(Debug, Clone, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct Object {
     name: OsString,
-    etag: String,
+    sha256: String,
     #[serde(with = "datetime_utc_serde")]
     last_modification_date: DateTime<Utc>,
 }
 
 impl PartialEq for Object {
     fn eq(&self, res: &Self) -> bool {
-        self.name == res.name && self.etag == res.etag
+        self.name == res.name && self.sha256 == res.sha256
     }
 }
 
@@ -369,16 +370,18 @@ impl DifferenceTree<OsString, Object> {
         bucket: &'a Bucket,
         prefix: PathBuf,
         base_dir: &'a Path,
-        selector: &Selector<Pin<Box<dyn Future<Output = Result<(), S3Error>> + 'a>>>,
-    ) {
+        selector: &Selector<Pin<Box<dyn Future<Output = Result<()>> + 'a>>>,
+    ) -> Result<()> {
         let mut current_dir = base_dir.to_path_buf();
         current_dir.push(prefix.as_path());
-        // depth-first sync: sync children before values
+
         for (key, child) in &self.children {
             let mut prefix = prefix.clone();
             prefix.push(&key);
-            child.update_bucket_with_prefix(bucket, prefix, base_dir, &selector);
+            child.update_bucket_with_prefix(bucket, prefix, base_dir, &selector)?;
         }
+
+        // TODO: for object supdate (aka deleted and then reuploaded, add some ordering)
         if let Some(old_values) = &self.old_values {
             for i in old_values {
                 let mut path = prefix.to_path_buf();
@@ -400,41 +403,58 @@ impl DifferenceTree<OsString, Object> {
                 let mut local_path = current_dir.to_path_buf();
                 local_path.push(&i.name);
                 // upload the local file
+                let sha256 = HeaderValue::from_bytes(i.sha256.as_bytes())?;
                 selector.add(Box::pin(async move {
                     println!("Uploading {:?}", path);
+                    let mut custom_headers = HeaderMap::new();
+                    custom_headers.insert(HeaderName::from_static("x-amz-meta-sha256"), sha256);
                     let status_code = bucket
-                        .put_object_stream(local_path.to_str().unwrap(), path.to_str().unwrap())
+                        .put_object_stream_with_headers(
+                            local_path.to_str().unwrap(),
+                            path.to_str().unwrap(),
+                            Some(custom_headers),
+                        )
                         .await?;
                     assert_eq!(status_code, 200);
                     Ok(())
                 }));
             }
         }
+
+        Ok(())
     }
 
-    async fn update_bucket(&self, bucket: &Bucket, base_dir: &Path) -> Result<(), S3Error> {
+    async fn update_bucket(&self, bucket: &Bucket, base_dir: &Path) -> Result<()> {
         let selector = selector(vec![], 5);
-        self.update_bucket_with_prefix(bucket, PathBuf::new(), base_dir, &selector);
+        self.update_bucket_with_prefix(bucket, PathBuf::new(), base_dir, &selector)?;
         selector.await
     }
 }
 
 /// Iterate over all the objects in the bucket, and generate a tree of their hierarchy
-async fn read_elements_from_bucket(bucket: &Bucket) -> Result<Tree<OsString, Object>, S3Error> {
+async fn read_elements_from_bucket(bucket: &Bucket) -> Result<Tree<OsString, Object>> {
     let mut res = Tree::new();
 
     let bucket_res_list = bucket.list("".into(), None).await?;
 
+    // TODO: perform head requests in //
     for obj_list in bucket_res_list {
         let mut keys = Vec::with_capacity(obj_list.contents.len());
         for e in &obj_list.contents {
             let mut paths: Vec<OsString> = e.key.split("/").map(|e| e.into()).collect();
             let file_name = paths.pop().unwrap();
+            let (object, _) = bucket.head_object(&e.key).await?;
+            let sha256 = if let Some(ref metadata) = object.metadata {
+                metadata.get("sha256").map(|x| x.as_str()).unwrap_or("")
+            } else {
+                ""
+            };
+
             keys.push((
                 paths,
                 Object {
                     name: file_name.into(),
-                    etag: e.e_tag[1..e.e_tag.len() - 1].to_string(),
+                    sha256: sha256.to_string(),
                     // doesn't matter for comparisons
                     last_modification_date: DateTime::parse_from_rfc3339(&e.last_modified)
                         .unwrap()
@@ -454,43 +474,15 @@ async fn read_elements_from_bucket(bucket: &Bucket) -> Result<Tree<OsString, Obj
 /// read a file and compute its hash
 fn hash_file(path: impl AsRef<Path>) -> Result<String, std::io::Error> {
     let mut fd = File::open(path)?;
-    let mut digest = Md5::new();
-    let mut buf = Vec::with_capacity(4096);
-    for i in 0u64..4096 {
-        buf.push(i as u8);
-    }
-    let mut nb_read: usize = 0;
-    let mut parts_no = 0;
-    let mut parts_md5 = Vec::new();
+    let mut digest = Sha256::new();
+    let mut buf = vec![0; 4096];
     loop {
         let read = fd.read(&mut buf)?;
-        nb_read += read;
         if read == 0 {
-            if parts_md5.len() == parts_no {
-                parts_md5.push(digest.finalize_reset());
-                //parts_md5.push(format!("{:x}", digest.finalize_reset()));
-                parts_no += 1;
-            }
-            if parts_md5.len() == 1 {
-                return Ok(format!("{:x}", parts_md5[0]));
-            }
-            let mut hexes = Md5::new();
-            for md5 in parts_md5 {
-                hexes.update(md5);
-            }
-            return Ok(format!(
-                "{}-{}",
-                format!("{:x}", hexes.finalize()),
-                parts_no
-            ));
+            return Ok(format!("{:x}", digest.finalize()));
         }
 
         digest.update(&buf[0..read]);
-
-        if nb_read / s3::bucket::CHUNK_SIZE != parts_no {
-            parts_no += 1;
-            parts_md5.push(digest.finalize_reset());
-        }
     }
 }
 
@@ -545,9 +537,7 @@ async fn read_update_data_from_folder(
 }
 
 /// Iterate over all the objects in the folder, and generate a tree of their hierarchy, using caching
-async fn read_elements_from_folder(
-    folder: &Path,
-) -> Result<Tree<OsString, Object>, tokio::io::Error> {
+async fn read_elements_from_folder(folder: &Path) -> Result<Tree<OsString, Object>> {
     let mut file_listing = folder.to_path_buf();
     file_listing.push(RESERVED_FILE);
     let old_listing = ObjectModificationListing::load(&file_listing).await?;
@@ -562,7 +552,7 @@ async fn read_elements_from_folder(
 }
 
 #[tokio::main]
-async fn main() -> Result<(), S3Error> {
+async fn main() -> Result<()> {
     let matches = App::new("s3s")
         .version("0.1")
         .author("Simon Thoby <git@nightmared.fr>")
@@ -641,9 +631,7 @@ async fn main() -> Result<(), S3Error> {
     let folder = matches.value_of("Folder").unwrap();
     let folder_path = PathBuf::from(folder);
 
-    let listing_tasks: Vec<
-        Pin<Box<dyn Future<Output = Result<Tree<OsString, Object>, std::io::Error>>>>,
-    > = vec![
+    let listing_tasks: Vec<Pin<Box<dyn Future<Output = Result<Tree<OsString, Object>>>>>> = vec![
         Box::pin(async move {
             let res = read_elements_from_folder(folder_path.as_path()).await?;
             println!("Local files listed.");
@@ -662,12 +650,9 @@ async fn main() -> Result<(), S3Error> {
         [a, b] => (a, b),
         _ => panic!("Unknown error occured"),
     };
-    println!("{:?}", folder_objects);
-    println!("{:?}", bucket_objects);
 
     println!("Computing the difference...");
     let difference = DifferenceTreeResult::from(&(Some(bucket_objects), Some(folder_objects)));
-    println!("{:?}", difference);
 
     if let DifferenceTreeResult(Some(d)) = difference {
         d.update_bucket(&bucket, &Path::new(folder)).await?;

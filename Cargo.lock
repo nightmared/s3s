@@ -16,6 +16,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.36"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68803225a7b13e47191bab76f2687382b60d259e8cf37f6e1893658b84bb9479"
+
+[[package]]
 name = "arrayref"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -74,27 +80,27 @@ checksum = "cdb031dd78e28731d87d56cc8ffef4a8f36ca26c38fe2de700543e627f8a464a"
 
 [[package]]
 name = "aws-creds"
-version = "0.25.0"
+version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54c8271d6207a6859749ae7fd8121aeb33dcf5116bd9bd560cda2d56b5819508"
+checksum = "1331d069460a674d42bd27c12b47ce578f789954c7bd7f239fd030771eca6616"
 dependencies = [
+ "anyhow",
  "attohttpc",
  "dirs",
  "rust-ini",
  "serde",
  "serde-xml-rs",
  "serde_derive",
- "simpl",
  "url",
 ]
 
 [[package]]
 name = "aws-region"
-version = "0.22.1"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f610af4a396f07592014dc3410f6ad78fab931852a99bb6cfdc1ad04b9329b80"
+checksum = "1fa55aac0e78292a96c295725b911cda8f30dd60546a1a528b2012e5559ab43e"
 dependencies = [
- "simpl",
+ "anyhow",
 ]
 
 [[package]]
@@ -736,17 +742,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "md-5"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b5a279bb9607f9f53c22d496eade00d138d1bdcccd07d74650387cf94942a15"
-dependencies = [
- "block-buffer",
- "digest",
- "opaque-debug",
-]
-
-[[package]]
 name = "md5"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1135,9 +1130,10 @@ dependencies = [
 
 [[package]]
 name = "rust-s3"
-version = "0.27.0-beta1"
-source = "git+https://github.com/nightmared/rust-s3?rev=4d2a3731cb1cfc7c281f65b1829e7d9a904af622#4d2a3731cb1cfc7c281f65b1829e7d9a904af622"
+version = "0.27.0-beta6"
+source = "git+https://github.com/nightmared/rust-s3?rev=a5774a5c32855c886ea79b048793864e3f82f4bc#a5774a5c32855c886ea79b048793864e3f82f4bc"
 dependencies = [
+ "anyhow",
  "async-trait",
  "aws-creds",
  "aws-region",
@@ -1157,7 +1153,6 @@ dependencies = [
  "serde-xml-rs",
  "serde_derive",
  "sha2",
- "simpl",
  "tokio",
  "url",
 ]
@@ -1185,15 +1180,17 @@ checksum = "71d301d4193d031abdd79ff7e3dd721168a9572ef3fe51a1517aba235bd8f86e"
 name = "s3s"
 version = "0.1.6"
 dependencies = [
+ "anyhow",
  "chrono",
  "clap",
  "futures",
- "md-5",
+ "http",
  "rayon",
  "rust-s3",
  "serde",
  "serde_json",
  "serde_with",
+ "sha2",
  "tokio",
 ]
 
@@ -1303,12 +1300,6 @@ dependencies = [
  "digest",
  "opaque-debug",
 ]
-
-[[package]]
-name = "simpl"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a30f10c911c0355f80f1c2faa8096efc4a58cdf8590b954d5b395efa071c711"
 
 [[package]]
 name = "slab"
