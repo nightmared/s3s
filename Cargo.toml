@@ -1,6 +1,6 @@
 [package]
 name = "s3s"
-version = "0.1.6"
+version = "0.1.7"
 authors = ["Simon THOBY <git@nightmared.fr>"]
 edition = "2018"
 
@@ -8,10 +8,10 @@ edition = "2018"
 futures = "0.3.8"
 chrono = "0.4"
 #rust-s3 = { version = "0.26.3", default-features = false, features = ["rustls-tls"] }
-rust-s3 = { git = "https://github.com/nightmared/rust-s3", rev = "a5774a5c32855c886ea79b048793864e3f82f4bc", default-features = false, features = ["with-tokio", "tokio-rustls-tls"] }
-#rust-s3 = { path = "/home/nightmared/dev/rust-s3/s3" }
+rust-s3 = { git = "https://github.com/nightmared/rust-s3", rev = "efcca41adc0075992ecd6a0293a7380a958c2039", default-features = false, features = ["with-tokio", "tokio-rustls-tls"] }
+#rust-s3 = { path = "/home/nightmared/dev/rust-s3/s3", default-features = false, features = ["with-tokio", "tokio-rustls-tls"] }
 clap = "2.33"
-tokio = { version = "0.2.24", features = ["rt-threaded", "blocking", "macros", "fs"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "fs"] }
 sha2 = "0.9.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_with = { version = "1.6.0", features = ["macros", "json" ] }

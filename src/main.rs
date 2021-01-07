@@ -1,10 +1,8 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt::Debug;
-use std::fs::File;
 use std::future::Future;
 use std::hash::Hash;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
@@ -20,10 +18,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{from_slice, to_vec};
 use serde_with::serde_as;
 use sha2::{Digest, Sha256};
-use tokio::fs::{read, read_dir, write};
+use tokio::fs::{read, read_dir, write, File};
+use tokio::io::AsyncReadExt;
 
 mod select;
-use select::{selector, Selector};
+use select::{select_vec, selector, Selector};
 
 const RESERVED_FILE: &'static str = ".s3s_modification_listing";
 
@@ -96,39 +95,41 @@ fn path_transform<'a>(
     source_tree: &'a ObjectModificationListing,
     path: Vec<OsString>,
     obj: &'a ObjectUpdateData,
-) -> Object {
-    let mut res = None;
-    // the logic is the following: check if the same version of the file is present across the list of
-    // files present in the same folder
-    if let Some(objs) = source_tree.0.get(&path) {
-        // reuse the hash only if the cache file is as old as the one on the fileystem
-        res = objs
-            .iter()
-            .filter(|cached_obj| {
-                cached_obj.name == obj.name
-                    && cached_obj.last_modification_date < obj.last_modification_date
-            })
-            // take the first entry, as there can only be a single entry for a
-            // given name
-            .next();
-    }
+) -> Pin<Box<dyn Future<Output = Object> + Sync + Send + 'a>> {
+    Box::pin(async move {
+        let mut res = None;
+        // the logic is the following: check if the same version of the file is present across the list of
+        // files present in the same folder
+        if let Some(objs) = source_tree.0.get(&path) {
+            // reuse the hash only if the cache file is as old as the one on the fileystem
+            res = objs
+                .iter()
+                .filter(|cached_obj| {
+                    cached_obj.name == obj.name
+                        && cached_obj.last_modification_date < obj.last_modification_date
+                })
+                // take the first entry, as there can only be a single entry for a
+                // given name
+                .next();
+        }
 
-    match res {
-        Some(res) => res.clone(),
-        None => {
-            // create a new value
-            let mut file_path = folder.to_path_buf();
-            for e in &*path {
-                file_path.push(e);
-            }
-            file_path.push(&obj.name);
-            Object {
-                name: obj.name.clone(),
-                sha256: hash_file(&file_path).unwrap(),
-                last_modification_date: obj.last_modification_date,
+        match res {
+            Some(res) => res.clone(),
+            None => {
+                // create a new value
+                let mut file_path = folder.to_path_buf();
+                for e in &*path {
+                    file_path.push(e);
+                }
+                file_path.push(&obj.name);
+                Object {
+                    name: obj.name.clone(),
+                    sha256: hash_file(&file_path).await.unwrap(),
+                    last_modification_date: obj.last_modification_date,
+                }
             }
         }
-    }
+    })
 }
 
 /// An abstraction for files
@@ -230,7 +231,7 @@ where
         path: Vec<K>,
     ) -> Pin<Box<dyn Future<Output = Tree<K, W>> + 'a>>
     where
-        F: Fn(Vec<K>, &V) -> W + Sync,
+        F: Fn(Vec<K>, &'a V) -> Pin<Box<dyn Future<Output = W> + 'a + Sync + Send>> + Sync,
         K: Hash,
         W: Eq + Send,
     {
@@ -243,15 +244,23 @@ where
                 children.insert(key.clone(), res);
             }
 
-            let values = tokio::task::block_in_place(|| {
+            let values_fut: Option<Vec<Pin<Box<dyn Future<Output = W> + Sync + Send>>>> =
                 self.values.as_ref().map(|self_values| {
                     self_values
                         .as_slice()
                         .par_iter()
                         .map(|x| fun(path.clone(), &x))
                         .collect()
-                })
-            });
+                });
+
+            let mut values = None;
+            if let Some(mut values_fut) = values_fut {
+                let mut res = Vec::with_capacity(values_fut.len());
+                select_vec(&mut values_fut, &mut res)
+                    .await
+                    .expect("Couldn't process file informations");
+                values = Some(res);
+            }
 
             Tree { children, values }
         })
@@ -262,7 +271,7 @@ where
         fun: &'a F,
     ) -> Pin<Box<dyn Future<Output = Tree<K, W>> + 'a>>
     where
-        F: Fn(Vec<K>, &V) -> W + Sync,
+        F: Fn(Vec<K>, &'a V) -> Pin<Box<dyn Future<Output = W> + 'a + Sync + Send>> + Sync,
         W: Eq + Send,
     {
         self.transform_with_path_internal(fun, Vec::new())
@@ -505,16 +514,18 @@ async fn read_elements_from_bucket(bucket: &Bucket) -> Result<Tree<OsString, Obj
 }
 
 /// read a file and compute its hash
-fn hash_file(path: impl AsRef<Path>) -> Result<String, std::io::Error> {
-    let mut fd = File::open(path)?;
+async fn hash_file(path: impl AsRef<Path>) -> Result<String, std::io::Error> {
+    let mut fd = File::open(path).await?;
     let mut digest = Sha256::new();
     let mut buf = vec![0; 4096];
     loop {
-        let read = fd.read(&mut buf)?;
+        let read = fd.read(&mut buf).await?;
         if read == 0 {
             return Ok(format!("{:x}", digest.finalize()));
         }
 
+        // we assume the sha256 operation to be fast enought on 4K blocks for its impact to be
+        // reasonable on the async scheduler
         digest.update(&buf[0..read]);
     }
 }
@@ -587,7 +598,7 @@ async fn read_elements_from_folder(folder: &Path) -> Result<Tree<OsString, Objec
 #[tokio::main]
 async fn main() -> Result<()> {
     let matches = App::new("s3s")
-        .version("0.1")
+        .version("0.1.7")
         .author("Simon Thoby <git@nightmared.fr>")
         .about("Sync a folder to a s3 bucket")
         .arg(
@@ -691,5 +702,16 @@ async fn main() -> Result<()> {
         d.update_bucket(&bucket, &Path::new(folder)).await?;
     }
     println!("Sync complete");
+
+    println!("Clearing old dangling parts...");
+    for result in bucket.list_multiparts_uploads(None, None).await? {
+        for upload in result.uploads {
+            if let Err(_) = bucket.abort_upload(&upload.key, &upload.id).await {
+                println!("Couldn't abort multipart upload for '{}'", upload.key);
+            }
+        }
+    }
+
+    println!("Old parts cleared");
     Ok(())
 }

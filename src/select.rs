@@ -64,3 +64,51 @@ impl<Fut: TryFuture + Unpin> Future for Selector<Fut> {
         }
     }
 }
+
+// do not preserve ordering
+pub struct SelectVec<'a, R, Fut: Future<Output = R>> {
+    inner: &'a mut Vec<Fut>,
+    output: &'a mut Vec<R>,
+}
+
+impl<'a, R, Fut: Future<Output = R> + Unpin> Unpin for SelectVec<'a, R, Fut> {}
+
+pub fn select_vec<'a, R, F: Future<Output = R>>(
+    v: &'a mut Vec<F>,
+    res: &'a mut Vec<R>,
+) -> SelectVec<'a, R, F>
+where
+    F: Unpin,
+{
+    SelectVec {
+        inner: v,
+        output: res,
+    }
+}
+
+impl<'a, R, Fut: Future<Output = R> + Unpin> Future for SelectVec<'a, R, Fut> {
+    type Output = Option<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.inner.len() == 0 {
+            return Poll::Ready(None);
+        }
+        let item =
+            self.inner
+                .iter_mut()
+                .enumerate()
+                .find_map(|(i, f)| match Pin::new(f).poll(cx) {
+                    Poll::Pending => None,
+                    Poll::Ready(e) => Some((i, e)),
+                });
+        if let Some((idx, res)) = item {
+            self.inner.swap_remove(idx);
+            self.output.push(res);
+
+            if self.inner.is_empty() {
+                return Poll::Ready(Some(()));
+            }
+        }
+        Poll::Pending
+    }
+}
