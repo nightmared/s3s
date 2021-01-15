@@ -1,0 +1,50 @@
+{
+    "cargo2nix": {
+        "branch": "master",
+        "description": "Build Rust crates with Nix",
+        "homepage": "",
+        "owner": "cargo2nix",
+        "repo": "cargo2nix",
+        "rev": "a47a344b865c399a773e257e1ef1fc052c27ee86",
+        "sha256": "0jh62261l7was3yb44nzp22v0ma3w9ivzfbwnqk76rk0b91kala0",
+        "type": "tarball",
+        "url": "https://github.com/cargo2nix/cargo2nix/archive/a47a344b865c399a773e257e1ef1fc052c27ee86.tar.gz",
+        "url_template": "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
+    },
+    "niv": {
+        "branch": "master",
+        "description": "Easy dependency management for Nix projects",
+        "homepage": "https://github.com/nmattia/niv",
+        "owner": "nmattia",
+        "repo": "niv",
+        "rev": "3cd7914b2c4cff48927e11c216dadfab7d903fe5",
+        "sha256": "1agq4nvbhrylf2s77kb4xhh9k7xcwdwggq764k4jgsbs70py8cw3",
+        "type": "tarball",
+        "url": "https://github.com/nmattia/niv/archive/3cd7914b2c4cff48927e11c216dadfab7d903fe5.tar.gz",
+        "url_template": "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
+    },
+    "nixpkgs": {
+        "branch": "nixpkgs-unstable",
+        "description": "Nix Packages collection",
+        "homepage": "",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "495066a47fc259aa4fc5f7548e190fded2c7030e",
+        "sha256": "0q448yk73r5acbc8q3nw9hgwvi6y43cwxy8k6kgq7a5zk630rdx5",
+        "type": "tarball",
+        "url": "https://github.com/NixOS/nixpkgs/archive/495066a47fc259aa4fc5f7548e190fded2c7030e.tar.gz",
+        "url_template": "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
+    },
+    "nixpkgs-mozilla": {
+        "branch": "master",
+        "description": "mozilla related nixpkgs (extends nixos/nixpkgs repo)",
+        "homepage": null,
+        "owner": "mozilla",
+        "repo": "nixpkgs-mozilla",
+        "rev": "8c007b60731c07dd7a052cce508de3bb1ae849b4",
+        "sha256": "1zybp62zz0h077zm2zmqs2wcg3whg6jqaah9hcl1gv4x8af4zhs6",
+        "type": "tarball",
+        "url": "https://github.com/mozilla/nixpkgs-mozilla/archive/8c007b60731c07dd7a052cce508de3bb1ae849b4.tar.gz",
+        "url_template": "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
+    }
+}
