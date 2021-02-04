@@ -22,7 +22,7 @@ use tokio::fs::{read, read_dir, write, File};
 use tokio::io::AsyncReadExt;
 
 mod select;
-use select::{select_vec, selector, Selector};
+use select::{select_vec, select_vec_try, selector, Selector};
 
 const RESERVED_FILE: &'static str = ".s3s_modification_listing";
 
@@ -479,31 +479,38 @@ async fn read_elements_from_bucket(bucket: &Bucket) -> Result<Tree<OsString, Obj
 
     let bucket_res_list = bucket.list("".into(), None).await?;
 
-    // TODO: perform head requests in //
     for obj_list in bucket_res_list {
         let mut keys = Vec::with_capacity(obj_list.contents.len());
+        let mut futures: Vec<
+            Pin<Box<dyn Future<Output = Result<(Vec<OsString>, Object), anyhow::Error>>>>,
+        > = Vec::with_capacity(obj_list.contents.len());
         for e in &obj_list.contents {
             let mut paths: Vec<OsString> = e.key.split("/").map(|e| e.into()).collect();
             let file_name = paths.pop().unwrap();
-            let (object, _) = bucket.head_object(&e.key).await?;
-            let sha256 = if let Some(ref metadata) = object.metadata {
-                metadata.get("sha256").map(|x| x.as_str()).unwrap_or("")
-            } else {
-                ""
-            };
+            futures.push(Box::pin(async move {
+                let (object, _) = bucket.head_object(&e.key).await?;
+                let sha256 = if let Some(ref metadata) = object.metadata {
+                    metadata.get("sha256").map(|x| x.as_str()).unwrap_or("")
+                } else {
+                    ""
+                };
 
-            keys.push((
-                paths,
-                Object {
-                    name: file_name.into(),
-                    sha256: sha256.to_string(),
-                    // doesn't matter for comparisons
-                    last_modification_date: DateTime::parse_from_rfc3339(&e.last_modified)
-                        .unwrap()
-                        .into(),
-                },
-            ));
+                Ok((
+                    paths,
+                    Object {
+                        name: file_name.into(),
+                        sha256: sha256.to_string(),
+                        // doesn't matter for comparisons
+                        last_modification_date: DateTime::parse_from_rfc3339(&e.last_modified)
+                            .unwrap()
+                            .into(),
+                    },
+                ))
+            }));
         }
+
+        // fetch 15 objects in //
+        select_vec_try(&mut futures, &mut keys, 15).await?;
 
         if keys.len() > 0 {
             res.add_values_with_path(&mut keys);
@@ -598,7 +605,7 @@ async fn read_elements_from_folder(folder: &Path) -> Result<Tree<OsString, Objec
 #[tokio::main]
 async fn main() -> Result<()> {
     let matches = App::new("s3s")
-        .version("0.1.7")
+        .version("0.1.8")
         .author("Simon Thoby <git@nightmared.fr>")
         .about("Sync a folder to a s3 bucket")
         .arg(

@@ -112,3 +112,56 @@ impl<'a, R, Fut: Future<Output = R> + Unpin> Future for SelectVec<'a, R, Fut> {
         Poll::Pending
     }
 }
+
+// do not preserve ordering
+pub struct SelectVecTry<'a, R, E, Fut: Future<Output = Result<R, E>>> {
+    inner: &'a mut Vec<Fut>,
+    output: &'a mut Vec<R>,
+    nb_operations: usize,
+}
+
+impl<'a, R, E, Fut: Future<Output = Result<R, E>> + Unpin> Unpin for SelectVecTry<'a, R, E, Fut> {}
+
+pub fn select_vec_try<'a, R, E, F: Future<Output = Result<R, E>>>(
+    v: &'a mut Vec<F>,
+    res: &'a mut Vec<R>,
+    nb_operations: usize,
+) -> SelectVecTry<'a, R, E, F>
+where
+    F: Unpin,
+{
+    SelectVecTry {
+        inner: v,
+        output: res,
+        nb_operations,
+    }
+}
+
+impl<'a, R, E, Fut: Future<Output = Result<R, E>> + Unpin> Future for SelectVecTry<'a, R, E, Fut> {
+    type Output = Result<(), E>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let nb_operations = self.nb_operations;
+        let item = self
+            .inner
+            .iter_mut()
+            .enumerate()
+            .take(nb_operations)
+            .find_map(|(i, f)| match Pin::new(f).poll(cx) {
+                Poll::Pending => None,
+                Poll::Ready(e) => Some((i, e)),
+            });
+        if let Some((idx, res)) = item {
+            self.inner.swap_remove(idx);
+            match res {
+                Ok(x) => self.output.push(x),
+                Err(e) => return Poll::Ready(Err(e)),
+            };
+        }
+        if self.inner.is_empty() {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+}
