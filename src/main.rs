@@ -193,6 +193,8 @@ impl Config {
                     }
                     to_delete.insert(s3_path);
                 }
+            } else {
+                to_add = objects.iter().map(|(name, obj)| (name, obj.size)).collect();
             }
 
             let mut selector = Vec::new();
@@ -257,7 +259,8 @@ impl Config {
                         if let Ok(x) = timeout(
                             min(
                                 Duration::new(86400, 0),
-                                Duration::new(5 + size / 100_000, 0),
+                                // expect at least 1MB/s
+                                Duration::new(5 + size / 1_000_000, 0),
                             ),
                             upload_object_to_bucket(&self.bucket, &sha512, &path, &remote_path),
                         )
@@ -290,7 +293,7 @@ impl Config {
 #[tokio::main]
 async fn main() -> Result<()> {
     let matches = App::new("s3s")
-        .version("0.1.8")
+        .version("0.2.2")
         .author("Simon Thoby <git@nightmared.fr>")
         .about("Sync a folder to a s3 bucket")
         .arg(
