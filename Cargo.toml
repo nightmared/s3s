@@ -1,6 +1,6 @@
 [package]
 name = "s3s"
-version = "0.1.8"
+version = "0.2.0"
 authors = ["Simon THOBY <git@nightmared.fr>"]
 edition = "2018"
 
@@ -13,9 +13,5 @@ rust-s3 = { git = "https://github.com/nightmared/rust-s3", rev = "efcca41adc0075
 clap = "2.33"
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "fs"] }
 sha2 = "0.9.2"
-serde = { version = "1.0", features = ["derive"] }
-serde_with = { version = "1.6.0", features = ["macros", "json" ] }
-serde_json = "1.0"
-rayon = "1.5"
 anyhow = "1.0.36"
 http = "0.2.2"
