@@ -182,7 +182,6 @@ impl Config {
                     {
                         if object.last_modification_date > s3_obj.last_modification_date {
                             to_add.insert(file_path, object.size);
-                            to_delete.insert(file_path);
                         }
                     } else {
                         to_add.insert(file_path, object.size);
@@ -200,8 +199,11 @@ impl Config {
             let mut errors = Vec::new();
 
             for old_path in to_delete {
-                let path = {
-                    let mut path = current_dir.clone();
+                let remote_path = {
+                    let mut path = PathBuf::new();
+                    for entry in relative_path.iter() {
+                        path.push(entry);
+                    }
                     path.push(old_path);
                     path.to_string_lossy().to_string()
                 };
@@ -211,7 +213,7 @@ impl Config {
                     for _ in 0..nb_retry {
                         if let Ok(x) = timeout(
                             Duration::new(5, 0),
-                            delete_object_in_bucket(&self.bucket, &path),
+                            delete_object_in_bucket(&self.bucket, &remote_path),
                         )
                         .await
                         {
